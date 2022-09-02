@@ -12,6 +12,11 @@ import sys
 import util
 import config
 import demjson
+import re
+import emoji
+import warnings
+from bson.binary import Binary
+warnings.filterwarnings("ignore")
 reload(sys)
 sys.setdefaultencoding('utf-8')
 
@@ -26,7 +31,7 @@ class Mongodata:
         self.mysql_db = config.mysql_db_info[config.env]
         # 访问数据库连接
         self.mysql_conn = MySQLdb.connect(self.mysql_db[0], self.mysql_db[1], self.mysql_db[2], self.mysql_db[3],
-                                          charset=self.mysql_db[4], port=self.mysql_db[5])
+                                          charset=self.mysql_db[4], port=self.mysql_db[5], local_infile=1)
         # 访问数据库游标
         self.mysql_cursor = self.mysql_conn.cursor()
 
@@ -44,6 +49,9 @@ class Mongodata:
 
         # mongo 数据链接
         self.mongo_client = None
+
+        # mongo db
+        self.mongo_db = None
 
         # mongo 表
         self.mongo_table = None
@@ -83,6 +91,7 @@ class Mongodata:
             raise Exception("Missing parameters ID")
         sqlstr = "SELECT mongo_sorce, mysql_sorce, mongo_tb, mysql_tb, `colums`, `condition` " \
                  "FROM dw_etl_mongo_config_t WHERE id = %s" % self.mid
+        print sqlstr
         self.mysql_cursor.execute(sqlstr)
         result = self.mysql_cursor.fetchone()
         if result:
@@ -99,8 +108,9 @@ class Mongodata:
     def set_mongo_info(self):
         """ 设置MongoDB相关配置 """
         if self.mongo_sorce is not None and self.mongo_sorce < len(config.mongo_db_info):
-            uri = config.mongo_db_info[self.mongo_sorce]
+            uri = config.mongo_db_info[self.mongo_sorce].get('uri')
             self.mongo_client = pymongo.MongoClient(uri)
+            self.mongo_db = config.mongo_db_info[self.mongo_sorce].get('db', self.mongo_client.get_default_database().name)
         else:
             raise Exception(u"mongo配置信息错误")
 
@@ -130,6 +140,9 @@ class Mongodata:
             self.condition = self.condition\
                 .replace("start_date_tamp", str(start_date_tamp))\
                 .replace("end_date_tamp", str(end_date_tamp))
+            self.condition = self.condition\
+                .replace("start_date", str(start_date))\
+                .replace("end_date", str(end_date))
             self.condition = demjson.decode(self.condition)
 
     def set_mysql_colums(self):
@@ -153,7 +166,7 @@ class Mongodata:
                 获取 basicInfo 对象下的curretnCity 值
             支持无限层对象的显示
         """
-        filestr = ""
+        filelist = []
         for v in self.columns:
             fun_name = v[2] if len(v) > 2 else ""
             cols = v[0].split(".")
@@ -162,13 +175,28 @@ class Mongodata:
                 if k == 0:
                     val = item.get(y, {})
                 elif k == (len(cols) - 1):
-                    val = val.get(y, "")
+                    if isinstance(val, str) or isinstance(val, unicode):
+                        val = demjson.decode(val)
+                    if isinstance(val, dict):
+                        val = val.get(y, "")
+                    if 'reqparam' in v[0]:
+                        val = val[0] if isinstance(val, list) else ''
                 else:
                     val = val.get(y, {})
-                if fun_name == 'timestamp2string':
-                    val = util.timestamp2string(val)
-            filestr += '"%s",' % val
-        return filestr[:-1]
+                if y == '_id' and type(val) != str:
+                    val = str(val)
+                if isinstance(val, Binary):
+                    val = {}
+            if fun_name:
+                fn = fun_name.split(":")
+                func = fn.pop(0)
+                fn.insert(0, val)
+                kwargs = {}
+                val = eval("util.%s" % func)(*fn, **kwargs)
+            if isinstance(val, str):
+                val = MySQLdb.escape_string(val)
+            filelist.append(str(val).strip())
+        return "\t".join(filelist)
 
     @util.timer
     def save_mongo_data(self):
@@ -176,7 +204,8 @@ class Mongodata:
             保存获取到的Mongo数据
             每1000行保存一次
         """
-        stb = self.mongo_client[self.mongo_client.get_default_database().name][self.mongo_table]
+        print self.condition
+        stb = self.mongo_client[self.mongo_db][self.mongo_table]
         results = stb.find(self.condition)
         datalist = list()
         i = 0
@@ -215,24 +244,31 @@ class Mongodata:
     def save_file(self, ls=None):
         """保存为文件"""
         if ls:
-            with open(self.filename, "aw") as f:
-                f.write("\n".join(ls)+"\n")
+            f = open(self.filename, "aw")
+            f.write("\n".join(ls)+"\n")
+            f.close()
 
     @util.timer
     def load_file(self):
         """ 加载数据到Mysql """
-        sql = "LOAD DATA LOCAL INFILE '%s' REPLACE INTO TABLE %s FIELDS TERMINATED BY ',' " \
-              "ENCLOSED BY '\"' LINES TERMINATED BY '\n' (%s) " %\
-              (self.filename, self.mysql_table, ",".join(self.mysqlcolums))
-        self.exec_sql(sql)
-        print "load done!"
+        if os.path.exists(self.filename):
+            sql = "LOAD DATA LOCAL INFILE '%s' REPLACE INTO TABLE %s FIELDS TERMINATED BY '\t' " \
+                  "ENCLOSED BY '' LINES TERMINATED BY '\n' (%s) " %\
+                  (self.filename, self.mysql_table, ",".join(self.mysqlcolums))
+            print sql
+            self.exec_sql(sql)
+            print "load done!"
+        else:
+            print "no data"
 
     def truncate_table(self):
         """ 清空表数据 """
+        print u"清空表数据"
         self.exec_sql("TRUNCATE TABLE %s" % self.mysql_table)
 
     def start(self):
         """ 开始内容 """
+        print self.mysql_conn
         self.get_config()
         self.set_mongo_info()
         self.set_mysql_info()
